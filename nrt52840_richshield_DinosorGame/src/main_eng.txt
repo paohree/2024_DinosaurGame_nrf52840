@@ -1,0 +1,508 @@
+#include <zephyr/sys/util.h> // Includes utility functions
+#include <zephyr/drivers/gpio.h> // Includes GPIO driver functions
+#include <zephyr/drivers/led.h> // Includes LED driver functions
+#include <zephyr/devicetree.h> // Includes device tree definitions
+#include <zephyr/kernel.h> // Includes kernel functions
+#include <zephyr/logging/log.h> // Includes logging functions
+
+#include <zephyr/device.h> // Includes device functions
+#include <zephyr/drivers/sensor.h> // Includes sensor driver functions
+#include <zephyr/sys/printk.h> // Includes printk functions
+
+// 4x8 LED matrix number array definition
+int number_led_matrix_arr_4x8[10][32]= {
+    { // 0
+        0,1,1,0,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        0,1,1,0
+    },
+    { // 1
+        0,0,1,0,
+        0,1,1,0,
+        0,0,1,0,
+        0,0,1,0,
+        0,0,1,0,
+        0,0,1,0,
+        0,0,1,0,
+        0,1,1,1
+    },
+    { // 2
+        0,1,1,0,
+        1,0,0,1,
+        0,0,0,1,
+        0,0,1,0,
+        0,1,0,0,
+        1,0,0,0,
+        1,0,0,0,
+        1,1,1,1
+    },
+    { // 3
+        1,1,1,0,
+        0,0,0,1,
+        0,0,0,1,
+        0,1,1,0,
+        0,0,0,1,
+        0,0,0,1,
+        0,0,0,1,
+        1,1,1,0
+    },
+    { // 4
+        0,0,1,0,
+        0,1,1,0,
+        1,0,1,0,
+        1,0,1,0,
+        1,1,1,1,
+        0,0,1,0,
+        0,0,1,0,
+        0,0,1,0
+    },
+    { // 5
+        1,1,1,1,
+        1,0,0,0,
+        1,0,0,0,
+        1,1,1,0,
+        0,0,0,1,
+        0,0,0,1,
+        0,0,0,1,
+        1,1,1,0
+    },
+    { // 6
+        0,1,1,0,
+        1,0,0,0,
+        1,0,0,0,
+        1,1,1,0,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        0,1,1,0
+    },
+    { // 7
+        1,1,1,1,
+        0,0,0,1,
+        0,0,0,1,
+        0,0,1,0,
+        0,1,0,0,
+        0,1,0,0,
+        0,1,0,0,
+        0,1,0,0
+    },
+    { // 8
+        0,1,1,0,
+        1,0,0,1,
+        1,0,0,1,
+        0,1,1,0,
+        1,0,0,1,
+        1,0,0,1,
+        1,0,0,1,
+        0,1,1,0
+    },
+    { // 9
+        0,1,1,0,
+        1,0,0,1,
+        1,0,0,1,
+        0,1,1,1,
+        0,0,0,1,
+        0,0,0,1,
+        0,0,0,1,
+        1,1,1,0
+    }
+};
+
+// Register the log module
+LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
+
+#define LED_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(holtek_ht16k33) // Define the LED node
+
+const struct device *led; // Declare a global variable
+
+#define GPIO_FAIL -1 // Define GPIO fail code
+#define GPIO_OK 0 // Define GPIO success code
+
+static struct gpio_callback button0_cb_data; // Declare a callback data structure for button0
+static struct gpio_callback button_reset_cb_data; // Declare a callback data structure for the reset button
+
+#define GROUND_START 96 // Start position of the ground
+#define GROUND_END 128 // End position of the ground
+
+#define DINO_LED 84 // Define the LED position of the dinosaur
+#define LIVES 4 // Define the number of lives
+int lives = LIVES; // Initialize the current number of lives
+
+int score; // Score variable
+
+bool is_jumping = false; // Jump state variable
+int dino_pos = DINO_LED; // Current position of the dinosaur
+int previous_dino_pos = DINO_LED; // Previous position of the dinosaur (new variable)
+int obstacle_pos = GROUND_END - 1; // Position of the obstacle
+
+bool should_turn_off_led = false; // Variable to indicate if the LED should be turned off (new variable)
+int led_to_turn_off = 0; // Position of the LED to be turned off (new variable)
+
+#define BUTTON_NODE DT_ALIAS(sw0) // Define the button node
+#define RESET_NODE DT_ALIAS(sw1) // Define the reset node
+
+static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(BUTTON_NODE, gpios); // Button0 GPIO specification
+static const struct gpio_dt_spec button_reset = GPIO_DT_SPEC_GET(RESET_NODE, gpios); // Reset button GPIO specification
+
+// Using for rotary encoder
+struct sensor_value val; // Sensor value structure
+int rc; // Return code
+const struct device *const dev = DEVICE_DT_GET(DT_ALIAS(qdec0)); // Device pointer
+
+// LED GPIO specifications array
+static const struct gpio_dt_spec leds[] = {
+    GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios)
+};
+
+void game_loop(struct k_work *work); // Declare game loop function
+K_WORK_DELAYABLE_DEFINE(game_work, game_loop); // Define delayable work
+
+// Callback function for button0
+void button0_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    if (!is_jumping) { // If not jumping
+        should_turn_off_led = true; // Indicate that the LED should be turned off
+        led_to_turn_off = dino_pos; // Set the position of the LED to be turned off
+        is_jumping = true; // Set jump state
+        dino_pos -= 16; // Jump up one row
+        printk("Dino jumps to %d\n", dino_pos); // Print the position of the dinosaur
+    }
+}
+
+// Callback function for the reset button
+void button_reset_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    reset_game(); // Call the game reset function
+}
+
+// Game reset function
+void reset_game()
+{
+    lives = LIVES; // Initialize the number of lives
+    dino_pos = DINO_LED; // Initialize the position of the dinosaur
+    previous_dino_pos = DINO_LED; // Initialize the previous position of the dinosaur
+    obstacle_pos = GROUND_END - 1; // Initialize the position of the obstacle
+    is_jumping = false; // Initialize the jump state
+    should_turn_off_led = false; // Initialize the LED off state
+    score = 0; // Initialize the score
+
+    for (int i = 0; i < LIVES; i++) {
+        gpio_pin_set_dt(&leds[i], 1); // Turn on the life LEDs
+    }
+
+    printk("Game reset\n"); // Print game reset message
+
+    k_work_reschedule(&game_work, K_NO_WAIT); // Reschedule the game loop
+}
+
+// GPIO initialization function
+int gpio_init(void)
+{
+    int err = GPIO_FAIL; // Initialize error code
+
+    // Set button0 interrupt
+    printk("Setting button0 interrupt\n");
+
+    err = gpio_is_ready_dt(&button0); // Check if button0 GPIO is ready
+    if (!err) {
+        printk("Error gpio_is_ready_dt button0 pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+
+    err = gpio_pin_configure_dt(&button0, GPIO_INPUT | GPIO_PULL_UP); // Configure button0 pin
+    if (err < 0) {
+        printk("Error configuring button0 pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+
+    err = gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_TO_ACTIVE); // Configure button0 interrupt
+    if (err != 0) {
+        printk("Error configuring interrupt on button0 pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+    gpio_init_callback(&button0_cb_data, button0_callback, BIT(button0.pin)); // Initialize button0 callback
+    gpio_add_callback(button0.port, &button0_cb_data); // Add button0 callback
+
+    // Set reset button interrupt
+    printk("Setting reset button interrupt\n");
+
+    err = gpio_is_ready_dt(&button_reset); // Check if reset button GPIO is ready
+    if (!err) {
+        printk("Error gpio_is_ready_dt button_reset pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+
+    err = gpio_pin_configure_dt(&button_reset, GPIO_INPUT | GPIO_PULL_UP); // Configure reset button pin
+    if (err < 0) {
+        printk("Error configuring button_reset pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+
+    err = gpio_pin_interrupt_configure_dt(&button_reset, GPIO_INT_EDGE_TO_ACTIVE); // Configure reset button interrupt
+    if (err != 0) {
+        printk("Error configuring interrupt on button_reset pin %d\n", err); // Print error message
+        return GPIO_FAIL; // Return fail code
+    }
+    gpio_init_callback(&button_reset_cb_data, button_reset_callback, BIT(button_reset.pin)); // Initialize reset button callback
+    gpio_add_callback(button_reset.port, &button_reset_cb_data); // Add reset button callback
+
+    // Configure LEDs
+    for (int i = 0; i < LIVES; i++) {
+        if (!device_is_ready(leds[i].port)) {
+            printk("Error: LED device %d not ready\n", i); // Print error message
+            return GPIO_FAIL; // Return fail code
+        }
+        err = gpio_pin_configure_dt(&leds[i], GPIO_OUTPUT_ACTIVE); // Configure LED pin
+        if (err < 0) {
+            printk("Error %d: failed to configure LED %d pin\n", err, i); // Print error message
+            return GPIO_FAIL; // Return fail code
+        }
+    }
+
+    return GPIO_OK; // Return success code
+}
+
+// Game loop function
+void game_loop(struct k_work *work)
+{
+    static int jump_counter = 0; // Jump counter
+    static int game_speed = 121; // Game speed (milliseconds)
+    static int loop_counter = 0; // Loop counter variable
+    const int speed_up_interval = 50; // Speed up interval (loop count)
+    const int min_game_speed = 20; // Minimum game speed (milliseconds)
+    const int max_game_speed = 500; // Maximum game speed (milliseconds)
+
+    // Handle jumping logic
+    if (is_jumping) {
+        jump_counter++;
+        led_off(led, dino_pos); // Turn off the current dinosaur position LED
+        if (jump_counter >= 5) { // Adjust jump duration
+            dino_pos += 16; // Fall back down
+            is_jumping = false; // Clear jump state
+            jump_counter = 0; // Reset jump counter
+            printk("Dino falls to %d\n", dino_pos); // Print the position of the dinosaur
+        }
+    }
+
+    // Turn off LED if needed
+    if (should_turn_off_led) {
+        led_off(led, led_to_turn_off); // Turn off the specified LED
+        should_turn_off_led = false; // Clear the state
+    }
+
+    // Turn off the previous position LED when falling down
+    if (!is_jumping && previous_dino_pos != dino_pos) {
+        led_off(led, previous_dino_pos); // Turn off the previous position LED
+        previous_dino_pos = dino_pos; // Update the previous position
+    }
+
+    // Set new Dino position
+    led_on(led, dino_pos); // Turn on the new position LED
+    
+    // Ensure ground LEDs are always on
+    for (int i = GROUND_START; i < GROUND_END; i++) {
+        led_on(led, i); // Turn on the ground position LEDs
+    }
+
+    // Move obstacle
+    if (obstacle_pos >= 80) {
+        led_off(led, obstacle_pos); // Turn off the current obstacle position LED
+        obstacle_pos--; // Move the obstacle position
+        if (obstacle_pos < 80) {
+            obstacle_pos = 96 - 1; // Reset the obstacle position
+        } else {
+            led_on(led, obstacle_pos); // Turn on the new obstacle position LED
+        }
+    }
+
+    // Check for collision
+    if (dino_pos == obstacle_pos) {
+        printk("Collision detected at %d!\n", dino_pos); // Print collision position
+        lives--; // Decrease the number of lives
+        for (int i = 0; i < 128; i++) {
+            led_on(led, i); // Turn on all LEDs
+            k_sleep(K_MSEC(10)); // Sleep for a while
+        }
+        for (int i = 128; i >= 0; i--) {
+            led_off(led, i); // Turn off all LEDs
+            k_sleep(K_MSEC(10)); // Sleep for a while
+        }
+        if (lives > 0) {
+            gpio_pin_set_dt(&leds[lives], 0); // Turn off the remaining life LED
+            obstacle_pos = GROUND_END - 1; // Reset the obstacle position
+        } else {
+            // Game over
+            for (int i = 0; i < 128; i++) {
+                led_on(led, i); // Turn on all LEDs
+            }
+            k_sleep(K_MSEC(75)); // Sleep for a while
+            for (int i = 128; i >= 0; i--) {
+                led_off(led, i); // Turn off all LEDs
+            }
+            k_sleep(K_MSEC(75)); // Sleep for a while
+
+            if(score > 9999)
+                score = 9999;
+            printk("score %d\n",score); // Print the score
+            int thousands=0, hundreds=0, tens=0, ones=0;
+
+            // Extract digits
+            thousands = score / 1000;
+            hundreds = (score % 1000) / 100;
+            tens = (score % 100) / 10;
+            ones = score % 10;
+
+            int num_arr_idx = 0;
+
+            // Set the LED for the thousands place
+            for(int i = 0; i < 128; i+=16){
+                for(int j = i; j < (i+4); j++){
+                    if(number_led_matrix_arr_4x8[thousands][num_arr_idx] == 1){
+                        led_on(led, j);
+                    } else {
+                        led_off(led, j);
+                    }
+
+                    num_arr_idx++;
+                }
+            }
+
+            num_arr_idx = 0;
+
+            // Set the LED for the hundreds place
+            for(int i = 0; i < 128; i+=16){
+                for(int j = (i+4); j < (i+8); j++){
+                    if(number_led_matrix_arr_4x8[hundreds][num_arr_idx] == 1){
+                        led_on(led, j);
+                    } else {
+                        led_off(led, j);
+                    }
+                    num_arr_idx++;
+                }
+            }
+
+            num_arr_idx = 0;
+
+            // Set the LED for the tens place
+            for(int i = 0; i < 128; i+=16){
+                for(int j = (i+8); j < (i+12); j++){
+                    if(number_led_matrix_arr_4x8[tens][num_arr_idx] == 1){
+                        led_on(led, j);
+                    } else {
+                        led_off(led, j);
+                    }
+
+                    num_arr_idx++;
+                }
+            }
+
+            num_arr_idx = 0;
+
+            // Set the LED for the ones place
+            for(int i = 0; i < 128; i+=16){
+                for(int j = (i+12); j < (i+16); j++){
+                    if(number_led_matrix_arr_4x8[ones][num_arr_idx] == 1){
+                        led_on(led, j);
+                    } else {
+                        led_off(led, j);
+                    }
+                    num_arr_idx++;
+                }
+            }
+
+            // Turn off the life LEDs
+            for (int i = 0; i < LIVES; i++) {
+                gpio_pin_set_dt(&leds[i], 0);
+            }
+            k_sleep(K_MSEC(75)); // Sleep for a while
+
+            return; // Exit function
+        }
+    }
+
+    // Game speed increase logic
+    rc = sensor_sample_fetch(dev); // Fetch sensor sample
+    if (rc != 0) {
+        printk("Failed to fetch sample (%d)\n", rc); // Print error message
+        return; // Exit function
+    }
+
+    rc = sensor_channel_get(dev, SENSOR_CHAN_ROTATION, &val); // Get sensor channel value
+    if (rc != 0) {
+        printk("Failed to get data (%d)\n", rc); // Print error message
+        return; // Exit function
+    }
+    
+    loop_counter++;
+    if (val.val1 != 0) {
+        
+        game_speed -= (val.val1 / 18) * 5; // Decrease speed (increase game speed)
+        if(game_speed < min_game_speed){
+            game_speed = min_game_speed;
+        }
+        else if(game_speed > max_game_speed){
+            game_speed = max_game_speed;
+        }
+        printk("encoder_val : %d\n",val.val1); // Print encoder value
+        printk("Increasing game speed: %d ms\n", game_speed); // Print game speed
+    }
+    else if (loop_counter % speed_up_interval == 0 && game_speed > min_game_speed) {
+        game_speed -= 5; // Decrease speed (increase game speed)
+        printk("Increasing game speed: %d ms\n", game_speed); // Print game speed
+    }
+
+    // Schedule next iteration
+    score++;
+    k_work_reschedule(&game_work, K_MSEC(game_speed)); // Reschedule the game loop
+}
+
+// Main function
+void main(void)
+{
+    int err;
+
+    err = gpio_init(); // Initialize GPIO
+    if (err != GPIO_OK) {
+        printk("Error gpio_init %d\n", err); // Print error message
+        return; // Exit function
+    }
+
+    led = DEVICE_DT_GET(LED_NODE); // Get the LED device
+    if (!device_is_ready(led)) {
+        LOG_ERR("LED device not ready"); // Print error message
+        return; // Exit function
+    }
+
+    printk("LED device ready\n"); // Print device ready message
+
+    led_set_brightness(led, 0, 0.1); // Set LED brightness
+
+    for (int i = GROUND_START; i < GROUND_END; i++) {
+        led_on(led, i); // Turn on ground LEDs
+    }
+
+    // Set initial Dino position
+    led_on(led, dino_pos); // Turn on dinosaur LED
+
+    // Initialize lives LEDs
+    for (int i = 0; i < LIVES; i++) {
+        gpio_pin_set_dt(&leds[i], 1); // Turn on life LEDs
+    }
+
+    // Check for rotary encoder
+    if (!device_is_ready(dev)) {
+		printk("Qdec device is not ready\n"); // Print error message
+		return; // Exit function
+	}
+
+    // Start game loop
+    k_work_schedule(&game_work, K_NO_WAIT); // Schedule the game loop
+}
